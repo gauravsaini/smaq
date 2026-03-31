@@ -192,3 +192,90 @@ class KVCaptureEngine:
         self.ring.reset()
         self.store.reset()
         self._prefill_done = False
+
+
+class SlidingWindowBuffer:
+    """KV buffer for sliding-window attention layers.
+
+    Unlike ``KVCaptureEngine``, this buffer simply **discards** overflow when
+    the ring wraps instead of forwarding it to a compressed store.  This is
+    correct for sliding-window layers where keys older than the window are
+    never attended to — compressing them would be wasted work and memory.
+
+    The ring capacity should be set equal to the attention window size so
+    that the buffer holds exactly the set of keys the layer can attend to.
+
+    Typical usage::
+
+        buf = SlidingWindowBuffer(
+            window_size=4096,
+            num_kv_heads=8,
+            head_dim=64,
+            device=torch.device("cuda"),
+        )
+        buf.ingest(key_tokens, value_tokens, num_tokens)
+        recent_k, recent_v = buf.peek()
+    """
+
+    __slots__ = ("ring", "_total_evicted")
+
+    def __init__(
+        self,
+        window_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.ring = RingBuffer(
+            capacity=window_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self._total_evicted = 0
+
+    @property
+    def window_size(self) -> int:
+        return self.ring.capacity
+
+    @property
+    def size(self) -> int:
+        return self.ring.size
+
+    @property
+    def total_evicted(self) -> int:
+        return self._total_evicted
+
+    def ingest(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        num_tokens: int,
+    ):
+        """Write tokens into the window buffer, silently discarding overflow.
+
+        This is the key difference from ``KVCaptureEngine``: overflow tokens
+        that exit the window are dropped, not compressed.
+        """
+        overflow = self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
+        if overflow is not None:
+            self._total_evicted += overflow[0].shape[0]
+            # Deliberately discard — these keys are beyond the window
+
+    def peek(self) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Return the current window contents without draining."""
+        return self.ring.peek()
+
+    def reset(self):
+        self.ring.reset()
+        self._total_evicted = 0
+
+    def memory_bytes(self) -> int:
+        """Constant memory: just the ring buffer, no compressed store."""
+        return (
+            self.ring._k.nelement() * self.ring._k.element_size()
+            + self.ring._v.nelement() * self.ring._v.element_size()
+        )
+
