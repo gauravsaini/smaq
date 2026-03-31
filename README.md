@@ -1,5 +1,7 @@
 # SMAQ: Workload-Aware Vector Quantization for KV Cache Compression
 
+Paper : https://doi.org/10.5281/zenodo.19342144
+
 SMAQ is a KV-cache compression method for LLM inference.
 
 Technically, SMAQ is a query-aware compression framework that replaces
