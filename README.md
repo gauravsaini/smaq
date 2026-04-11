@@ -129,6 +129,59 @@ adapter = RotationAdapter(
 # - Custom rotations
 ```
 
+### Complementary Usage: SMAQ Keys + TurboQuant Values
+
+A common source of confusion is whether SMAQ *replaces* TurboQuant. The answer is **no, they are complementary**. 
+
+Fundamentally:
+1. **Keys (K):** Handled by the **SMAQ Quantizer**. This prevents the geometry loss that standard rotation invariant methods encounter, preserving query-sensitive directions.
+2. **Values (V):** Handled by standard **TurboQuant group quantization** (e.g., 2-bit or 4-bit block-wise packed).
+3. **Execution Pipeline:** Because the value layout remains entirely identical to TurboQuant's design, the runtime can seamlessly slot into the exact same highly optimized decode patterns that TurboQuant uses. 
+
+The `smaq/integration/vllm.py` orchestrator sets both of these up via a single hook injection. You don't have to initialize them separately.
+
+#### Example: Complementary vLLM Integration
+
+```python
+from vllm import LLM
+from smaq.integration.vllm import install_hooks, set_mode, MODE_HYBRID, free_kv_cache
+
+# 1. Initialize your model using vLLM
+llm = LLM(model="meta-llama/Llama-2-7b-chat-hf", enforce_eager=True)
+model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
+
+# 2. Inject the SMAQ+TurboQuant combination hook
+# By default, this assigns Keys to SMAQ and Values to standard group quantization
+layer_states = install_hooks(
+    model_runner,
+    key_bits=3,              # SMAQ Quantizer targets 3-bit for keys
+    value_bits=2,            # TurboQuant group quant targets 2-bit for values
+    ring_capacity=128,       # Exact recent tokens buffer size
+    initial_layers_count=4   # E.g. use higher fidelity on first 4 layers
+)
+
+# 3. Activate Hybrid Inference (SMAQ Compressed + Exact Recent)
+set_mode(MODE_HYBRID)
+
+# (Optional) Free the redundant paged exact cache to observe real memory gains
+freed_memory_mb = free_kv_cache(model_runner) / 1e6
+print(f"Freed: {freed_memory_mb} MB")
+
+# Now generate tokens!
+outputs = llm.generate(["Write a python script for quicksort."])
+```
+
+#### Expected Results: Why use SMAQ + TurboQuant instead of pure TurboQuant?
+
+The key reason to use this combination is a massive boost in **Accuracy/Quality** while retaining TurboQuant's **Speed and Memory** efficiency. 
+
+- **The Problem with Pure TurboQuant for Keys:** TurboQuant uses rotation-based preprocessing (like Hadamard) which is proven to yield **zero mathematical gain** for adaptive vector quantization (since VQ is rotation-invariant). You get speed, but the key vectors suffer precision loss in critical directions.
+- **The SMAQ Solutions (Quality):** SMAQ replaces that ineffective rotation with **query-aware spectral metric shaping**. Instead of rotating the space, it changes how quantization noise is distributed, protecting the exact directions that the attention mechanism cares about the most. For coding and precise-domain workloads, this reduces the Logit MSE by **60% to 67%** compared to standard VQ (as shown in the Llama/Qwen tables above).
+- **Memory footprint:** Effectively identical to pure native TurboQuant (scaling down to ~2.5-3 bits per parameter).
+- **Latency (Speed):** Decoding phase speedup natively matches pure TurboQuant because the value blocks are identical, letting it seamlessly leverage TurboQuant's fast fused kernel structural decode patterns.
+
+In short: **You get the speed and memory profile of TurboQuant, but with vastly superior attention accuracy.**
+
 ## Usage
 
 ```python
