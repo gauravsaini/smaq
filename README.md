@@ -51,9 +51,24 @@ showed strong gains:
 This is early evidence, not a full serving benchmark, but it supports the idea
 that SMAQ is especially promising for coding-oriented workloads.
 
+### TurboQuant Integration Results
+
+When using SMAQ's diagonal metric with TurboQuant's scalar quantizer, the
+auto-tuned adapter finds optimal parameters per layer:
+
+| Layer | Std (3b) | SMAQ (3b) | Best c | Rotation |
+|:------|---------:|----------:|:------:|:--------:|
+| L3    | ~190    | ~200     | varies | varies   |
+| L7    | ~166    | ~163     | varies | varies   |
+| L11   | ~163    | ~173     | varies | varies   |
+| L15   | ~96     | ~94      | varies | varies   |
+
+The adapter auto-tunes over `c ∈ {0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0}` and
+rotation (True/False) to find the best configuration per layer.
+
 ## Architecture
 
-```text
+```
 smaq/
 ├── ssf.py               # Log-compressed spectral shaping (core math)
 ├── block_vq.py          # Block VQ quantizer matching the paper's experiments
@@ -64,6 +79,7 @@ smaq/
 ├── score.py             # Hybrid attention: compressed history + exact recent
 ├── triton_kernels.py    # Packed dequant + score Triton microkernel
 ├── vllm_attn_backend.py # vLLM backend shim
+├── weighted_scalar.py   # RotationAdapter for TurboQuant/RotorQuant integration
 └── integration/
     └── vllm.py          # Full vLLM hook system: capture/hybrid/full modes
 ```
@@ -74,6 +90,44 @@ smaq/
 |:-----|:-------|:-------------|:------------|
 | **Block VQ** | `block_vq.py` | K-means in SMAQ-shaped space (256 centroids, 8D blocks) | ✅ Yes — Table 1 |
 | **Scalar** | `quantizer.py` | Per-dimension scalar quantization with SMAQ metric | Faster alternative |
+
+### Integration with TurboQuant/RotorQuant
+
+The `RotationAdapter` in `weighted_scalar.py` provides a bridge between SMAQ's
+query-aware metric and existing rotation-based quantizers like TurboQuant and
+RotorQuant. It works by:
+
+1. Accepting external rotation matrices (from any source)
+2. Accepting external Lloyd-Max codebooks (TurboQuant, RotorQuant)
+3. Applying SMAQ-derived diagonal metric scaling in the rotated basis
+4. Auto-tuning the spectral shaping parameter `c` per-layer
+
+```python
+from smaq import RotationAdapter
+
+# Option 1: Auto-tune on calibration data
+adapter, tuning = RotationAdapter.fit(
+    dim=128,
+    bits=3,
+    calibration_queries=q_cal,
+    calibration_keys=k_cal,
+    rotation=turboquant_rotation,
+)
+
+# Option 2: Manual configuration
+adapter = RotationAdapter(
+    dim=128, bits=3,
+    rotation=turboquant_rotation,
+    Sigma_q=Sigma_q,  # query covariance
+    c=5.0,            # spectral shaping parameter
+)
+
+# Works with any rotation-based quantizer:
+# - TurboQuant (full d×d random orthogonal)
+# - RotorQuant/PlanarQuant (block-diagonal 2D)
+# - IsoQuant (block-diagonal 4D)
+# - Custom rotations
+```
 
 ## Usage
 
