@@ -118,6 +118,16 @@ class SMAQQuantizer(torch.nn.Module):
         self.register_buffer("boundaries", boundaries)
         self.register_buffer("decision_boundaries", boundaries[1:-1].contiguous())
 
+    def fit(self, calibration_queries: torch.Tensor) -> "SMAQQuantizer":
+        """Refit the metric from calibration queries."""
+        q = calibration_queries.float()
+        centered = q - q.mean(dim=0, keepdim=True)
+        Sigma_q = (centered.T @ centered) / max(1, centered.shape[0])
+        E, E_inv = build_smaq_metric(Sigma_q.to(torch.float32), c=5.0)
+        self.E.copy_(E.to(self.E.device, dtype=self.E.dtype))
+        self.E_inv.copy_(E_inv.to(self.E_inv.device, dtype=self.E_inv.dtype))
+        return self
+
     def rotate_query(self, query: torch.Tensor) -> torch.Tensor:
         """
         Project queries into the inverse metric space so dot products can be

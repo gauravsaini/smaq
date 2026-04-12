@@ -8,11 +8,13 @@ runtime can slot into the same decode pattern as TurboQuant.
 from __future__ import annotations
 
 import math
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 
-from smaq.quantizer import SMAQQuantized, SMAQQuantizer
+from smaq.calibration import IdentityCalibrationProvider
+from smaq.core import CacheCapabilities, CalibrationProvider
+from smaq.strategies import SMAQFullMetricScalarStrategy
 
 
 class ValueQuantized(NamedTuple):
@@ -115,6 +117,8 @@ class SMAQKVCache:
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float16,
         layer_idx: int = 0,
+        key_strategy: Any | None = None,
+        calibration_provider: CalibrationProvider | None = None,
     ):
         self.head_dim = head_dim
         self.key_bits = key_bits
@@ -124,20 +128,28 @@ class SMAQKVCache:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.layer_idx = layer_idx
+        self.calibration_provider = calibration_provider or IdentityCalibrationProvider()
+        resolved_sigma_q = Sigma_q
+        if resolved_sigma_q is None:
+            resolved_sigma_q = self.calibration_provider.get_sigma_q(layer_idx, head_dim, device=self.device)
 
-        self.key_quantizer = SMAQQuantizer(
+        self.key_quantizer = key_strategy or SMAQFullMetricScalarStrategy(
             dim=head_dim,
-            Sigma_q=Sigma_q,
+            Sigma_q=resolved_sigma_q,
             bits=key_bits,
             device=self.device,
             dtype=torch.float32,
         )
 
         self.seq_len = 0
-        self.key_quantized: Optional[SMAQQuantized] = None
+        self.key_quantized: Optional[Any] = None
         self.value_quantized: Optional[ValueQuantized] = None
         self.key_buffer: Optional[torch.Tensor] = None
         self.value_buffer: Optional[torch.Tensor] = None
+
+    @property
+    def capabilities(self) -> CacheCapabilities:
+        return self.key_quantizer.capabilities
 
     def prefill(self, keys: torch.Tensor, values: torch.Tensor):
         """Capture a full prefill segment."""
@@ -195,11 +207,7 @@ class SMAQKVCache:
             self.value_quantized = new_val_q
             return
 
-        self.key_quantized = SMAQQuantized(
-            indices=torch.cat([self.key_quantized.indices, new_key_q.indices], dim=-2),
-            norms=torch.cat([self.key_quantized.norms, new_key_q.norms], dim=-1),
-            bits=new_key_q.bits,
-        )
+        self.key_quantized = self.key_quantizer.concat_quantized([self.key_quantized, new_key_q])
         self.value_quantized = ValueQuantized(
             data=torch.cat([self.value_quantized.data, new_val_q.data], dim=-2),
             scales=torch.cat([self.value_quantized.scales, new_val_q.scales], dim=-2),
@@ -214,11 +222,14 @@ class SMAQKVCache:
 
         scores_parts = []
         if self.key_quantized is not None:
-            scores_parts.append(
-                self.key_quantizer.attention_score(
-                    query, self.key_quantized, scale=scale, use_kernel=True
+            if getattr(self.key_quantizer, "supports_kernel", False):
+                scores_parts.append(
+                    self.key_quantizer.attention_score(
+                        query, self.key_quantized, scale=scale, use_kernel=True
+                    )
                 )
-            )
+            else:
+                scores_parts.append(self.key_quantizer.attention_score(query, self.key_quantized, scale=scale))
 
         if self.key_buffer is not None:
             scores_parts.append(torch.matmul(query, self.key_buffer.transpose(-2, -1)) * scale)
@@ -260,8 +271,7 @@ class SMAQKVCache:
         info = {"quantized_keys": 0, "quantized_values": 0, "buffer": 0, "total": 0}
 
         if self.key_quantized is not None:
-            info["quantized_keys"] += self.key_quantized.indices.nelement()
-            info["quantized_keys"] += self.key_quantized.norms.nelement() * 2
+            info["quantized_keys"] += self.key_quantizer.memory_bytes(self.key_quantized)
 
         if self.value_quantized is not None:
             info["quantized_values"] += self.value_quantized.data.nelement()
