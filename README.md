@@ -1,5 +1,7 @@
 # SMAQ
 
+Paper : https://doi.org/10.5281/zenodo.19342144
+
 SMAQ is the parent research/integration repo for **Spectral Metric-Aware Quantization**.
 
 This repo now contains the **generic SMAQ core** and supporting benchmark scripts:
