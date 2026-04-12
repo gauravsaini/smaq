@@ -16,6 +16,7 @@ env/
 
 # uv
 .python-version
+uv.lock
 
 # IDE
 .vscode/
@@ -55,3 +56,8 @@ smaq/codebooks/*.pt
 
 # Triton cache
 .triton/
+
+# Local nested repos / notes
+smaq-mlx/
+Running SMAQ Gemma Model.md
+scripts/

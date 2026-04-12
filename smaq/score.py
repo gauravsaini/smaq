@@ -13,8 +13,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from smaq.core import AttentionBackend
 from smaq.kv_cache import dequantize_values
-from smaq.quantizer import SMAQQuantized, SMAQQuantizer
 from smaq.store import CompressedKVStore, FlatCache
 
 MIN_HISTORY_FOR_SMAQ = 16
@@ -75,7 +75,7 @@ def compute_hybrid_attention(
 def _quantized_scores(
     query: torch.Tensor,
     flat: FlatCache,
-    quantizer: SMAQQuantizer,
+    quantizer,
     gqa_ratio: int,
     num_kv_heads: int,
     scale: float,
@@ -85,12 +85,11 @@ def _quantized_scores(
     head_scores = []
 
     for head_idx in range(num_kv_heads):
-        key_q = SMAQQuantized(
-            indices=flat.key_q.indices[head_idx],
-            norms=flat.key_q.norms[head_idx],
-            bits=flat.key_q.bits,
-        )
-        scores = quantizer.attention_score(q[head_idx], key_q, scale=scale, use_kernel=True)
+        key_q = quantizer.select_head(flat.key_q, head_idx)
+        if getattr(quantizer, "supports_kernel", False):
+            scores = quantizer.attention_score(q[head_idx], key_q, scale=scale, use_kernel=True)
+        else:
+            scores = quantizer.attention_score(q[head_idx], key_q, scale=scale)
         head_scores.append(scores)
 
     stacked = torch.stack(head_scores, dim=0)
@@ -137,3 +136,25 @@ def _attend_exact_only(
     scores = _exact_scores(query, recent_k, gqa_ratio, num_kv_heads, scale)
     weights = F.softmax(scores, dim=-1)
     return _apply_weights(weights, recent_v.transpose(0, 1), gqa_ratio, num_kv_heads, query.dtype)
+
+
+class HybridAttentionBackend(AttentionBackend):
+    """Concrete torch attention backend using compressed history and exact tail."""
+
+    def compute(
+        self,
+        query,
+        store,
+        recent_k,
+        recent_v,
+        num_query_heads,
+        scale: Optional[float] = None,
+    ):
+        return compute_hybrid_attention(
+            query=query,
+            store=store,
+            recent_k=recent_k,
+            recent_v=recent_v,
+            num_query_heads=num_query_heads,
+            scale=scale,
+        )

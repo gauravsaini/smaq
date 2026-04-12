@@ -7,18 +7,20 @@ mirroring the TurboQuant storage pattern.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 
+from smaq.calibration import IdentityCalibrationProvider
+from smaq.core import CacheCapabilities, CalibrationProvider
 from smaq.kv_cache import ValueQuantized, quantize_values
-from smaq.quantizer import SMAQQuantized, SMAQQuantizer
+from smaq.strategies import SMAQFullMetricScalarStrategy
 
 
 class FlatCache(NamedTuple):
     """Flattened view for fast read access."""
 
-    key_q: SMAQQuantized
+    key_q: Any
     value_q: ValueQuantized
     num_tokens: int
 
@@ -36,6 +38,8 @@ class CompressedKVStore:
         value_group_size: int = 32,
         device: torch.device | None = None,
         layer_idx: int = 0,
+        key_strategy: Any | None = None,
+        calibration_provider: CalibrationProvider | None = None,
     ):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
@@ -45,18 +49,28 @@ class CompressedKVStore:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.layer_idx = layer_idx
 
-        self.quantizer = SMAQQuantizer(
+        self.calibration_provider = calibration_provider or IdentityCalibrationProvider()
+        resolved_sigma_q = Sigma_q
+        if resolved_sigma_q is None:
+            resolved_sigma_q = self.calibration_provider.get_sigma_q(layer_idx, head_dim, device=self.device)
+
+        self.key_strategy = key_strategy or SMAQFullMetricScalarStrategy(
             dim=head_dim,
-            Sigma_q=Sigma_q,
+            Sigma_q=resolved_sigma_q,
             bits=key_bits,
             device=self.device,
             dtype=torch.float32,
         )
+        self.quantizer = self.key_strategy
 
-        self._key_chunks: list[SMAQQuantized] = []
+        self._key_chunks: list[Any] = []
         self._value_chunks: list[ValueQuantized] = []
         self._chunk_lengths: list[int] = []
         self._flat: Optional[FlatCache] = None
+
+    @property
+    def capabilities(self) -> CacheCapabilities:
+        return self.key_strategy.capabilities
 
     @property
     def num_tokens(self) -> int:
@@ -72,7 +86,7 @@ class CompressedKVStore:
         k = key.transpose(0, 1).unsqueeze(0)
         v = value.transpose(0, 1).unsqueeze(0)
 
-        key_q = self.quantizer.quantize(k)
+        key_q = self.key_strategy.quantize(k)
         val_q = quantize_values(v, bits=self.value_bits, group_size=self.value_group_size)
 
         self._key_chunks.append(key_q)
@@ -88,10 +102,12 @@ class CompressedKVStore:
             return self._flat
 
         if len(self._key_chunks) == 1:
-            flat_kq = _flatten_key_q(self._key_chunks[0])
+            flat_kq = self.key_strategy.flatten_quantized(self._key_chunks[0])
             flat_vq = _flatten_value_q(self._value_chunks[0])
         else:
-            flat_kq = _concat_key_q([_flatten_key_q(chunk) for chunk in self._key_chunks])
+            flat_kq = self.key_strategy.concat_quantized(
+                [self.key_strategy.flatten_quantized(chunk) for chunk in self._key_chunks]
+            )
             flat_vq = _concat_value_q([_flatten_value_q(chunk) for chunk in self._value_chunks])
 
         self._flat = FlatCache(key_q=flat_kq, value_q=flat_vq, num_tokens=self.num_tokens)
@@ -100,8 +116,7 @@ class CompressedKVStore:
     def memory_bytes(self) -> int:
         total = 0
         for key_q in self._key_chunks:
-            total += key_q.indices.nelement()
-            total += key_q.norms.nelement() * 2
+            total += self.key_strategy.memory_bytes(key_q)
         for value_q in self._value_chunks:
             total += value_q.data.nelement()
             total += value_q.scales.nelement() * 2
@@ -115,15 +130,6 @@ class CompressedKVStore:
         self._flat = None
 
 
-def _flatten_key_q(key_q: SMAQQuantized) -> SMAQQuantized:
-    """Collapse batch dim `(1, H, T, ...) -> (H, T, ...)`."""
-    return SMAQQuantized(
-        indices=key_q.indices.reshape(-1, key_q.indices.shape[-2], key_q.indices.shape[-1]).contiguous(),
-        norms=key_q.norms.reshape(-1, key_q.norms.shape[-1]).contiguous(),
-        bits=key_q.bits,
-    )
-
-
 def _flatten_value_q(value_q: ValueQuantized) -> ValueQuantized:
     """Collapse batch dim `(1, H, T, ...) -> (H, T, ...)`."""
     value_bits = value_q.bits if len(value_q) > 3 else 2
@@ -132,15 +138,6 @@ def _flatten_value_q(value_q: ValueQuantized) -> ValueQuantized:
         scales=value_q.scales.reshape(-1, value_q.scales.shape[-2], value_q.scales.shape[-1]).contiguous(),
         zeros=value_q.zeros.reshape(-1, value_q.zeros.shape[-2], value_q.zeros.shape[-1]).contiguous(),
         bits=value_bits,
-    )
-
-
-def _concat_key_q(chunks: list[SMAQQuantized]) -> SMAQQuantized:
-    """Concatenate flattened key chunks along token dimension."""
-    return SMAQQuantized(
-        indices=torch.cat([chunk.indices for chunk in chunks], dim=-2),
-        norms=torch.cat([chunk.norms for chunk in chunks], dim=-1),
-        bits=chunks[0].bits,
     )
 
 
